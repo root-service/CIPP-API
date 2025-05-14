@@ -29,16 +29,14 @@ Function Invoke-EditUser {
     $AddToGroups = $Request.body.AddToGroups
     $RemoveFromGroups = $Request.body.RemoveFromGroups
 
-    # Write to the Azure Functions log stream.
-    Write-Host 'PowerShell HTTP trigger function processed a request.'
+
     #Edit the user
     try {
         Write-Host "$([boolean]$UserObj.MustChangePass)"
-        $UserPrincipalName = "$($UserObj.Username ? $UserObj.username :$UserObj.mailNickname)@$($UserObj.Domain ? $UserObj.Domain : $UserObj.primDomain.value)"
+        $UserPrincipalName = "$($UserObj.username)@$($UserObj.Domain ? $UserObj.Domain : $UserObj.primDomain.value)"
         $BodyToship = [pscustomobject] @{
             'givenName'         = $UserObj.givenName
             'surname'           = $UserObj.surname
-            'accountEnabled'    = $true
             'displayName'       = $UserObj.displayName
             'department'        = $UserObj.Department
             'mailNickname'      = $UserObj.Username ? $UserObj.username :$UserObj.mailNickname
@@ -51,6 +49,7 @@ Function Invoke-EditUser {
             'streetAddress'     = $UserObj.streetAddress
             'postalCode'        = $UserObj.PostalCode
             'companyName'       = $UserObj.CompanyName
+            'businessPhones'    = $UserObj.businessPhones ? @($UserObj.businessPhones) : @()
             'otherMails'        = $UserObj.otherMails ? @($UserObj.otherMails) : @()
             'passwordProfile'   = @{
                 'forceChangePasswordNextSignIn' = [bool]$UserObj.MustChangePass
@@ -89,22 +88,46 @@ Function Invoke-EditUser {
     try {
 
         if ($licenses -or $UserObj.removeLicenses) {
-            $CurrentLicenses = New-GraphGetRequest -uri "https://graph.microsoft.com/beta/users/$($UserObj.id)" -tenantid $UserObj.tenantFilter
-            #if the list of skuIds in $CurrentLicenses.assignedLicenses is EXACTLY the same as $licenses, we don't need to do anything, but the order in both can be different.
-            if (($CurrentLicenses.assignedLicenses.skuId -join ',') -eq ($licenses -join ',') -and $UserObj.removeLicenses -eq $false) {
-                Write-Host "$($CurrentLicenses.assignedLicenses.skuId -join ',') $(($licenses -join ','))"
-                $null = $results.Add( 'Success. User license is already correct.' )
-            } else {
-                if ($UserObj.removeLicenses) {
-                    $licResults = Set-CIPPUserLicense -UserId $UserObj.id -TenantFilter $UserObj.tenantFilter -RemoveLicenses $CurrentLicenses.assignedLicenses.skuId -Headers $Request.Headers
-                    $null = $results.Add($licResults)
-                } else {
-                    #Remove all objects from $CurrentLicenses.assignedLicenses.skuId that are in $licenses
-                    $RemoveLicenses = $CurrentLicenses.assignedLicenses.skuId | Where-Object { $_ -notin $licenses }
-                    $licResults = Set-CIPPUserLicense -UserId $UserObj.id -TenantFilter $UserObj.tenantFilter -RemoveLicenses $RemoveLicenses -AddLicenses $licenses -Headers $Request.headers
-                    $null = $results.Add($licResults)
+            if ($UserObj.sherwebLicense.value) {
+                $License = Set-SherwebSubscription -TenantFilter $UserObj.tenantFilter -SKU $UserObj.sherwebLicense.value -Add 1
+                $null = $results.Add('Added Sherweb License, scheduling assignment')
+                $taskObject = [PSCustomObject]@{
+                    TenantFilter  = $UserObj.tenantFilter
+                    Name          = "Assign License: $UserPrincipalName"
+                    Command       = @{
+                        value = 'Set-CIPPUserLicense'
+                    }
+                    Parameters    = [pscustomobject]@{
+                        userId      = $UserObj.id
+                        APIName     = 'Sherweb License Assignment'
+                        AddLicenses = $licenses
+                    }
+                    ScheduledTime = 0 #right now, which is in the next 15 minutes and should cover most cases.
+                    PostExecution = @{
+                        Webhook = [bool]$Request.Body.PostExecution.webhook
+                        Email   = [bool]$Request.Body.PostExecution.email
+                        PSA     = [bool]$Request.Body.PostExecution.psa
+                    }
                 }
+                Add-CIPPScheduledTask -Task $taskObject -hidden $false -Headers $Headers
+            } else {
+                $CurrentLicenses = New-GraphGetRequest -uri "https://graph.microsoft.com/beta/users/$($UserObj.id)" -tenantid $UserObj.tenantFilter
+                #if the list of skuIds in $CurrentLicenses.assignedLicenses is EXACTLY the same as $licenses, we don't need to do anything, but the order in both can be different.
+                if (($CurrentLicenses.assignedLicenses.skuId -join ',') -eq ($licenses -join ',') -and $UserObj.removeLicenses -eq $false) {
+                    Write-Host "$($CurrentLicenses.assignedLicenses.skuId -join ',') $(($licenses -join ','))"
+                    $null = $results.Add( 'Success. User license is already correct.' )
+                } else {
+                    if ($UserObj.removeLicenses) {
+                        $licResults = Set-CIPPUserLicense -UserId $UserObj.id -TenantFilter $UserObj.tenantFilter -RemoveLicenses $CurrentLicenses.assignedLicenses.skuId -Headers $Request.Headers
+                        $null = $results.Add($licResults)
+                    } else {
+                        #Remove all objects from $CurrentLicenses.assignedLicenses.skuId that are in $licenses
+                        $RemoveLicenses = $CurrentLicenses.assignedLicenses.skuId | Where-Object { $_ -notin $licenses }
+                        $licResults = Set-CIPPUserLicense -UserId $UserObj.id -TenantFilter $UserObj.tenantFilter -RemoveLicenses $RemoveLicenses -AddLicenses $licenses -Headers $Request.headers
+                        $null = $results.Add($licResults)
+                    }
 
+                }
             }
         }
 
@@ -140,15 +163,14 @@ Function Invoke-EditUser {
     if ($AddToGroups) {
         $AddToGroups | ForEach-Object {
 
-            $GroupType = $_.value.groupType -join ','
-            $GroupID = $_.value.groupid
-            $GroupName = $_.value.groupName
+            $GroupType = $_.addedFields.calculatedGroupType
+            $GroupID = $_.value
+            $GroupName = $_.label
             Write-Host "About to add $($UserObj.userPrincipalName) to $GroupName. Group ID is: $GroupID and type is: $GroupType"
 
             try {
 
                 if ($GroupType -eq 'Distribution list' -or $GroupType -eq 'Mail-Enabled Security') {
-
                     Write-Host 'Adding to group via Add-DistributionGroupMember '
                     $Params = @{ Identity = $GroupID; Member = $UserObj.id; BypassSecurityGroupManagerCheck = $true }
                     $null = New-ExoRequest -tenantid $UserObj.tenantFilter -cmdlet 'Add-DistributionGroupMember' -cmdParams $params -UseSystemMailbox $true
@@ -180,6 +202,14 @@ Function Invoke-EditUser {
         $null = New-GraphPostRequest -uri "https://graph.microsoft.com/beta/users/$($UserObj.id)/manager/`$ref" -tenantid $UserObj.tenantFilter -type PUT -body $ManagerBodyJSON -Verbose
         Write-LogMessage -headers $Request.Headers -API $ApiName -tenant $UserObj.tenantFilter -message "Set $($UserObj.DisplayName)'s manager to $($Request.body.setManager.label)" -Sev Info
         $null = $results.Add("Success. Set $($UserObj.DisplayName)'s manager to $($Request.body.setManager.label)")
+    }
+
+    if ($Request.body.setSponsor.value) {
+        $SponsorBody = [PSCustomObject]@{'@odata.id' = "https://graph.microsoft.com/beta/users/$($Request.body.setSponsor.value)" }
+        $SponsorBodyJSON = ConvertTo-Json -Compress -Depth 10 -InputObject $SponsorBody
+        $null = New-GraphPostRequest -uri "https://graph.microsoft.com/beta/users/$($UserObj.id)/sponsors/`$ref" -tenantid $UserObj.tenantFilter -type POST -body $SponsorBodyJSON -Verbose
+        Write-LogMessage -headers $Request.Headers -API $ApiName -tenant $UserObj.tenantFilter -message "Set $($UserObj.DisplayName)'s sponsor to $($Request.body.setSponsor.label)" -Sev Info
+        $null = $results.Add("Success. Set $($UserObj.DisplayName)'s sponsor to $($Request.body.setSponsor.label)")
     }
 
     if ($RemoveFromGroups) {
