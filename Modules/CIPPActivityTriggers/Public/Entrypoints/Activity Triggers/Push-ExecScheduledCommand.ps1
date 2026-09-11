@@ -79,14 +79,11 @@ function Push-ExecScheduledCommand {
         $TriggerType = $Trigger.Type.value ?? $Trigger.Type
         if ($TriggerType -eq 'DeltaQuery') {
             $IsTriggerTask = $true
-            $DeltaUrl = Get-DeltaQueryUrl -TenantFilter $Tenant -PartitionKey $task.RowKey
-            $DeltaQuery = @{
-                DeltaUrl     = $DeltaUrl
-                TenantFilter = $Tenant
-                PartitionKey = $task.RowKey
-            }
-            $Query = New-GraphDeltaQuery @DeltaQuery
 
+            #if recurrence is just a number, add it in days.
+            if ($task.Recurrence -match '^\d+$') {
+                $task.Recurrence = $task.Recurrence + 'd'
+            }
             $secondsToAdd = switch -Regex ($task.Recurrence) {
                 '(\d+)m$' { [int64]$matches[1] * 60 }
                 '(\d+)h$' { [int64]$matches[1] * 3600 }
@@ -96,13 +93,45 @@ function Push-ExecScheduledCommand {
 
             $Minutes = [int]($secondsToAdd / 60)
 
-            $DeltaQueryConditions = @{
-                Query        = $Query
-                Trigger      = $Trigger
-                TenantFilter = $Tenant
-                LastTrigger  = [datetime]::UtcNow.AddMinutes(-$Minutes)
+            # Without this a throw here escapes the entrypoint, leaving the task on the orchestrator's
+            # 'Pending' claim with nothing recorded, to be re-picked as a stale claim every hour.
+            try {
+                $DeltaUrl = Get-DeltaQueryUrl -TenantFilter $Tenant -PartitionKey $task.RowKey
+                $DeltaQuery = @{
+                    DeltaUrl     = $DeltaUrl
+                    TenantFilter = $Tenant
+                    PartitionKey = $task.RowKey
+                }
+                $Query = New-GraphDeltaQuery @DeltaQuery
+
+                $DeltaQueryConditions = @{
+                    Query        = $Query
+                    Trigger      = $Trigger
+                    TenantFilter = $Tenant
+                    LastTrigger  = [datetime]::UtcNow.AddMinutes(-$Minutes)
+                }
+                $DeltaResults = Test-DeltaQueryConditions @DeltaQueryConditions
+            } catch {
+                $ExceptionData = Get-CippException -Exception $_
+                if (!$IsMultiTenantExecution) {
+                    if ($secondsToAdd -gt 0) {
+                        $unixtimeNow = [int64](([datetime]::UtcNow) - (Get-Date '1/1/1970')).TotalSeconds
+                        if ([int64]$task.ScheduledTime -lt ($unixtimeNow - $secondsToAdd)) {
+                            $task.ScheduledTime = $unixtimeNow
+                        }
+                    }
+                    $null = Update-AzDataTableEntity -Force @Table -Entity @{
+                        PartitionKey  = $task.PartitionKey
+                        RowKey        = $task.RowKey
+                        Results       = "$($ExceptionData.NormalizedError)"
+                        ScheduledTime = [string]([int64]$task.ScheduledTime + [int64]$secondsToAdd)
+                        TaskState     = $secondsToAdd -gt 0 ? 'Failed - Planned' : 'Failed'
+                    }
+                }
+                Write-LogMessage -API 'Scheduler_UserTasks' -tenant $Tenant -tenantid $TenantInfo.customerId -message "Failed to evaluate the delta query trigger for task $($task.Name): $($ExceptionData.NormalizedError)" -sev Error -LogData $ExceptionData
+                Remove-Variable -Name ScheduledTaskId -Scope Script -ErrorAction SilentlyContinue
+                return
             }
-            $DeltaResults = Test-DeltaQueryConditions @DeltaQueryConditions
 
             if (-not $DeltaResults.ConditionsMet) {
                 Write-Information "Delta query conditions not met for tenant $Tenant. Skipping execution."
@@ -196,6 +225,24 @@ function Push-ExecScheduledCommand {
         }
     } catch {
         Write-Information "Failed to remove parameters: $($_.Exception.Message)"
+    }
+
+    # Stored parameters are user input: the command's tenant parameter is forced to the authorized
+    # task tenant so a stored value can never target another tenant. When a command declares more
+    # than one tenant-identifying name, only the most specific one is injected and the others are
+    # dropped so the command resolves them itself.
+    $DeclaredTenantParams = [array](@('TenantFilter', 'Tenant', 'TenantId') | Where-Object { $Function.Parameters.ContainsKey($_) })
+    foreach ($TenantParamName in $DeclaredTenantParams) {
+        $StoredTenantValue = $commandParameters[$TenantParamName]
+        $StoredTenantString = [string]($StoredTenantValue.value ?? $StoredTenantValue)
+        if (![string]::IsNullOrWhiteSpace($StoredTenantString) -and $StoredTenantString -ne [string]$Tenant) {
+            Write-LogMessage -API 'Scheduler_UserTasks' -tenant $Tenant -tenantid $TenantInfo.customerId -message "Task $($task.Name): stored parameter -$TenantParamName value '$StoredTenantString' does not match the authorized tenant '$Tenant' and was overridden." -sev Error
+        }
+        if ($TenantParamName -eq $DeclaredTenantParams[0]) {
+            $commandParameters[$TenantParamName] = $Tenant
+        } else {
+            $commandParameters.Remove($TenantParamName)
+        }
     }
 
     if ($IsTriggerTask -eq $true -and $Trigger.ExecutePerResource -ne $true) {
@@ -325,7 +372,11 @@ function Push-ExecScheduledCommand {
         }
     } catch {
         Write-Information "Failed to run task: $($_.Exception.Message)"
-        $errorMessage = $_.Exception.Message
+        # Captured before anything else can overwrite $_. Get-NormalizedError unwraps a JSON Graph or
+        # Exchange error body and returns the original string when it recognises nothing, so this is
+        # never less informative than the raw exception message it replaced.
+        $ExceptionData = Get-CippException -Exception $_
+        $errorMessage = $ExceptionData.NormalizedError
         #if recurrence is just a number, add it in days.
         if ($task.Recurrence -match '^\d+$') {
             $task.Recurrence = $task.Recurrence + 'd'
@@ -356,7 +407,7 @@ function Push-ExecScheduledCommand {
                 TaskState     = $State
             }
         }
-        Write-LogMessage -API 'Scheduler_UserTasks' -tenant $Tenant -tenantid $TenantInfo.customerId -message "Failed to execute task $($task.Name): $errorMessage" -sev Error -LogData (Get-CippExceptionData -Exception $_.Exception)
+        Write-LogMessage -API 'Scheduler_UserTasks' -tenant $Tenant -tenantid $TenantInfo.customerId -message "Failed to execute task $($task.Name): $errorMessage" -sev Error -LogData $ExceptionData
     }
 
     # For orchestrator-based commands, skip post-execution alerts as they will be handled by the orchestrator's post-execution function
@@ -371,7 +422,18 @@ function Push-ExecScheduledCommand {
         if ($TaskAttachments) {
             $AlertParams.Attachments = $TaskAttachments
         }
-        Send-CIPPScheduledTaskAlert @AlertParams
+        $PostExecutionResults = @(Send-CIPPScheduledTaskAlert @AlertParams)
+        # Keep the delivery outcomes with the task, so a failed webhook, email or PSA note shows on the task page.
+        try {
+            $TaskTable = Get-CippTable -tablename 'ScheduledTasks'
+            $null = Update-AzDataTableEntity -Force @TaskTable -Entity @{
+                PartitionKey         = $task.PartitionKey
+                RowKey               = $task.RowKey
+                PostExecutionResults = [string](ConvertTo-Json -Compress -Depth 5 -InputObject $PostExecutionResults)
+            }
+        } catch {
+            Write-Information "Could not store the post-execution results: $($_.Exception.Message)"
+        }
     }
 
     try {
