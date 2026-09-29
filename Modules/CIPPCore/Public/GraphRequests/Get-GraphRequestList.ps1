@@ -92,6 +92,13 @@ function Get-GraphRequestList {
     $Endpoint = $Endpoint -replace '^/', ''
     $DisplayName = ($Endpoint -split '/')[0]
 
+    # @odata.count is only returned when the request carries $count=true, so a CountOnly caller
+    # that did not also pass $count got a response with no count and CountOnly returned $null.
+    # Add it here (ConsistencyLevel:eventual is set via ComplexFilter on the count request below).
+    if ($CountOnly.IsPresent -and -not $Parameters.ContainsKey('$count')) {
+        $Parameters['$count'] = 'true'
+    }
+
     if ($QueueNameOverride) {
         $QueueName = $QueueNameOverride
     } else {
@@ -137,6 +144,10 @@ function Get-GraphRequestList {
         }
     }
     $GraphQuery.Query = $ParamCollection.ToString()
+    Test-CIPPGraphEndpointBlocked -Uri $GraphQuery.ToString() -Expand $BatchExpandQuery -Throw
+    if ($nextLink -match '^https://') {
+        Test-CIPPGraphEndpointBlocked -Uri $nextLink -Throw
+    }
     $PartitionKey = Get-StringHash -String (@($Endpoint, $ParamCollection.ToString(), 'v2') -join '-')
 
     # Perform $count check before caching
@@ -180,6 +191,7 @@ function Get-GraphRequestList {
             }
             $GraphQuery.Query = $ParamCollection.ToString()
             $GraphRequest.uri = $GraphQuery.ToString()
+            Test-CIPPGraphEndpointBlocked -Uri $GraphRequest.uri -Throw
         }
 
         if ($Parameters.'$count' -and -not $ManualPagination.IsPresent) {
